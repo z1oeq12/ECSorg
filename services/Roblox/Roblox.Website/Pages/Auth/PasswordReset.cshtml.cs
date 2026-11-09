@@ -1,200 +1,193 @@
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.RazorPages;
+using Roblox.AbuseDetection.Report;
+using Roblox.Dto.Users;
 using Roblox.Exceptions;
-using Roblox.Libraries.Captcha;
-using Roblox.Libraries.EasyJwt;
 using Roblox.Logging;
+using Roblox.Models.Sessions;
 using Roblox.Models.Users;
 using Roblox.Services;
 using Roblox.Services.App.FeatureFlags;
 using Roblox.Services.Exceptions;
-using Roblox.Website.WebsiteServices;
+using Roblox.Website.Controllers;
+using Roblox.Website.WebsiteModels;
+using ControllerBase = Roblox.Website.Controllers.ControllerBase;
 
 namespace Roblox.Website.Pages.Auth;
 
-// TODO: are we exposing too much info? should we expect the user to provide their social media url, then make sure it matches the one stored in the db?
-public class PasswordReset : RobloxPageModel
+public enum SignupMethod
 {
-    private const string InvalidUsernameMessage = "The username specified is invalid.";
-    private const string UnsupportedSiteException = "The site used to verify your account is currently not supported for password resets. We plan to add support for more sites in the future. Check back later. Please do not contact support as they cannot help you.";
-    private const string MissingVerificationUrl = "The social media URL used to create your account is no longer valid. You cannot reset your password.";
-    private const string VerificationIdChanged = "The ID of  account this username belonged to has changed. You can no longer change the password for this account.";
-    private const string CannotGenerateVerificationPhrase = "Unable to generate verification phrase.";
-    private const string CannotFindPhrase = "Could not find the phrase on your social media profile. You may have to wait a few minutes and try again.";
-    private const string Cooldown = "Too many attempts. Try again in a few minutes.";
-    private const string InvalidPasswordResetId = "This form is no longer valid. Please refresh the page and try again.";
-    private const string InvalidNewPassword = "Your new password is invalid. It must be at least 3 characters.";
+    Application = 1,
+    InviteUrl
+}
+
+public class Signup : RobloxPageModel
+{
     [BindProperty]
-    public string? username { get; set; }
+    public string username { get; set; }
     [BindProperty]
-    public string? action { get; set; }
-    [FromForm(Name = "h-captcha-response")]
-    public string hCaptchaResponse { get; set; }
-    public string siteKey => Configuration.HCaptchaPublicKey;
+    public string password { get; set; }
+    [BindProperty(SupportsGet = true)]
+    public string? applicationId { get; set; }
+    [BindProperty(SupportsGet = true)]
+    public string? inviteId { get; set; }
+    public UserInviteEntry? invite { get; set; }
+    public string? inviterUsername { get; set; }
     public string? errorMessage { get; set; }
-    public string? successMessage { get; set; }
-    public string? verificationPhrase { get; private set; }
-    [BindProperty]
-    public string? passwordResetId { get; set; }
-    [BindProperty]
-    public string? newPassword { get; set; }
+    public bool signupDisabled { get; set; }
 
-    private bool IsEnabled()
+    private void FeatureCheck()
     {
-        return FeatureFlags.IsEnabled(FeatureFlag.PasswordReset);
-    }
-    
-    public async Task<IActionResult> OnGet()
-    {
-        if (!IsEnabled())
-            return new RedirectResult("/auth/login");
-        
-        return new PageResult();
-    }
-
-    private async Task<bool> TryGenerateCode()
-    {
-        var apps = new ApplicationWebsiteService(HttpContext);
-       
-            Writer.Info(LogGroup.AbuseDetection, "Generate code for PasswordReset");
-            try
-            {
-                verificationPhrase = await apps.ApplyVerificationPhrase(hashedIp, ApplicationService.GenerationContext.PasswordReset);
-            }
-            catch (TooManyRequestsException)
-            {
-                errorMessage = "Too many attempts to generate a verification phrase. Make sure you have cookies enabled, then try again in a few minutes.";
-                return false;
-            }
-
-            return true;
-        
-    }
-
-    public async Task<IActionResult> OnPost()
-    {
-        if (!IsEnabled())
-            return new RedirectResult("/auth/login");
-        
-        if (string.IsNullOrWhiteSpace(username))
-        {
-            errorMessage = InvalidUsernameMessage;
-            return new PageResult();
-        }
-
-        long userId;
         try
         {
-            userId = await services.users.GetUserIdFromUsername(username);
+            FeatureFlags.FeatureCheck(FeatureFlag.SignupEnabled);
         }
-        catch (RecordNotFoundException)
+        catch (RobloxException)
         {
-            errorMessage = InvalidUsernameMessage;
-            return new PageResult();
+            errorMessage = "Signup is disabled at this time. Try again later.";
+            signupDisabled = true;
         }
-        var info = await services.users.GetUserById(userId);
-        var app = await services.users.GetApplicationByUserId(userId);
-        var url = app?.socialPresence ?? app?.verifiedUrl;
-        if (app == null || string.IsNullOrWhiteSpace(url))
+    }
+    
+    private async Task SetupInvite()
+    {
+        if (inviteId != null)
         {
-            errorMessage = MissingVerificationUrl;
-            return new PageResult();
+            invite = await services.users.GetInviteById(inviteId);
+            if (invite == null)
+                return;
+            inviterUsername = (await services.users.GetUserById(invite.authorId)).username;
+            if (invite.userId != null)
+            {
+                errorMessage = "This invite has already been used.";
+                signupDisabled = true;
+            }
         }
-        
-        if (!await TryGenerateCode())
-            return new PageResult();
-        
-        if (verificationPhrase == null)
+    }
+    public async Task<IActionResult> OnGet()
+    {
+        FeatureCheck();
+
+        if (userSession != null && applicationId is {Length: <= 128 and > 1})
         {
-            errorMessage = CannotGenerateVerificationPhrase;
-            return new PageResult();
+            var alreadyApproved = await services.users.IsUserApproved(userSession.userId);
+            if (!alreadyApproved)
+                await services.users.SetApplicationUserIdByJoinId(applicationId, userSession.userId);
+            return new RedirectResult("/");
         }
 
-        if (action == "verify")
-        {
-            // cooldown 1
-            if (!await services.cooldown.TryIncrementBucketCooldown("PasswordResetIP:V1:"+hashedIp, 10, TimeSpan.FromHours(1)))
-            {
-                errorMessage = Cooldown;
-                return new PageResult();
-            }
-            // cooldown 2
-            if (!await services.cooldown.TryIncrementBucketCooldown("PasswordResetUserID:V1:"+userId, 10, TimeSpan.FromMinutes(10)))
-            {
-                errorMessage = Cooldown;
-                return new PageResult();
-            }
-            // check captcha
-            var userIp = Roblox.Website.Controllers.ControllerBase.GetRequesterIpRaw(HttpContext);
-            if (!await HCaptcha.IsValid(userIp, hCaptchaResponse))
-            {
-                errorMessage = "Your captcha could not be verified. Please try again.";
-                return new PageResult();
-            }
-            var apps = new ApplicationWebsiteService(HttpContext);
-            
-            VerificationResult result;
-            try
-            {
-                result = await apps.AttemptVerifyUser(url, verificationPhrase);
-            }
-            catch (InvalidSocialMediaUrlException)
-            {
-                errorMessage = UnsupportedSiteException;
-                return new PageResult();
-            }
-            catch (UnableToFindVerificationPhraseException)
-            {
-                errorMessage = CannotFindPhrase;
-                return new PageResult();
-            }
+        await SetupInvite();
 
-            if (!result.isVerified)
-            {
-                errorMessage = UnsupportedSiteException;
-                return new PageResult();
-            }
-
-            // app.verifiedId can be null for old apps - only validate this on new apps
-            // TODO: security considerations? are there many apps with twitter usernames that were changed?
-            if (result.verifiedId != app.verifiedId && !string.IsNullOrWhiteSpace(app.verifiedId))
-            {
-                errorMessage = VerificationIdChanged;
-                return new PageResult();
-            }
-            
-            // We are verified
-            passwordResetId = await services.users.CreatePasswordResetEntry(userId, url, verificationPhrase);
-        }
-        else if (action == "change")
-        {
-            if (string.IsNullOrWhiteSpace(newPassword) || newPassword.Length < 3)
-            {
-                errorMessage = InvalidNewPassword;
-                return new PageResult();
-            }
-            
-            if (string.IsNullOrWhiteSpace(passwordResetId) || !Guid.TryParse(passwordResetId, out _))
-            {
-                errorMessage = InvalidPasswordResetId;
-                return new PageResult();
-            }
-            
-            await using var redemptionLock = await services.users.GetPasswordResetLock(passwordResetId);
-            var data = await services.users.GetPasswordResetEntry(passwordResetId);
-            if (data == null || 
-                data.userId != userId || 
-                data.createdAt < DateTime.UtcNow.AddHours(-1) || 
-                data.status != PasswordResetState.Created
-            ) {
-                errorMessage = InvalidPasswordResetId;
-                return new PageResult();
-            }
-
-            await services.users.RedeemPasswordReset(passwordResetId, newPassword);
-            successMessage = "Your password has been successfully updated.";
-        }
-        
         return new PageResult();
+    }
+
+    private bool IsGuidValid(string guid)
+    {
+        return Guid.TryParse(guid, out _);
+    }
+
+    private const string InvalidIdMessage = "Invalid application or invite ID. Please confirm the URL was copy and pasted correctly, then try again.";
+    private const string ExpiredApplicationMessage = "For security reasons, this application has been expired. Please create a new application and try again.";
+    
+    public async Task<IActionResult> OnPost()
+    {
+        // Error messages are intentionally vague. Let's keep it that way.
+
+        await SetupInvite();
+
+        FeatureFlags.FeatureCheck(FeatureFlag.SignupEnabled);
+        var ip = ControllerBase.GetIP(ControllerBase.GetRequesterIpRaw(HttpContext));
+
+        try
+        {
+            // Initial cooldown check - to prevent people spamming attempts
+            await services.cooldown.CooldownCheck($"signup:step1:" + ip, TimeSpan.FromSeconds(5));
+        }
+        catch (CooldownException)
+        {
+            Writer.Info(LogGroup.SignUp, "Sign up failed, cooldown step 1");
+            errorMessage = "Too many attempts. Try again in about 5 seconds.";
+            return new PageResult();
+        }
+
+        var redlockKey = "SignUpDirect:v1:" + ip;
+
+        await using var redLock = await Roblox.Services.Cache.redLock.CreateLockAsync(redlockKey, TimeSpan.FromMinutes(5));
+        if (!redLock.IsAcquired)
+        {
+            Writer.Info(LogGroup.SignUp, "Sign up attempt with app or invite failed - redlock");
+            errorMessage = "There was a recent attempt to sign up using this key. Try again in a minute.";
+            return new PageResult();
+        }
+
+        var usernameValid = await services.users.IsUsernameValid(username);
+        if (!usernameValid)
+        {
+            errorMessage = "Invalid Username. It must start and end with an alpha-numeric character, be between 3 and 21 characters, and contain at most one special character (space, period, or underscore). There are also some words that cannot be used in usernames.";
+            return Page();
+        }
+
+        var nameAvailable = await services.users.IsNameAvailableForSignup(username);
+        if (!nameAvailable)
+        {
+            errorMessage = "Username is already taken";
+            return Page();
+        }
+
+        var passwordValid = services.users.IsPasswordValid(password);
+        if (!passwordValid)
+        {
+            errorMessage = "Password is too simple";
+            return Page();
+        }
+
+        if (!await UsersAbuse.ShouldAllowCreation(new (ip)))
+        {
+            errorMessage = "Registration is not available at this time. Try again in a few hours, or contact a staff member.";
+            return new PageResult();
+        }
+        
+        // Created user, so add final cooldown
+        var signupFinalKey = "signup:step2:" + ip;
+        try
+        {
+            await services.cooldown.CooldownCheck(signupFinalKey, TimeSpan.FromMinutes(5));
+        }
+        catch (CooldownException)
+        {
+            errorMessage = "Too many attempts. Try again in about 5 minutes.";
+            return new PageResult();
+        }
+
+        // Now make the account
+        UserId createdUser;
+        try
+        {
+            createdUser =
+                await services.users.CreateUser(username, password, Gender.Unknown);
+        }
+        catch (Exception)
+        {
+            await services.cooldown.ResetCooldown(signupFinalKey);
+            throw;
+        }
+
+        Roblox.Metrics.UserMetrics.ReportUserSignUpFromApplication();
+
+        var sess = await services.users.CreateSession(createdUser.userId);
+        var sessionCookie = Roblox.Website.Middleware.SessionMiddleware.CreateJwt(new Middleware.JwtEntry()
+        {
+            sessionId = sess,
+            createdAt = DateTimeOffset.Now.ToUnixTimeSeconds(),
+        });
+        HttpContext.Response.Cookies.Append(Middleware.SessionMiddleware.CookieName, sessionCookie, new CookieOptions()
+        {
+            Secure = true,
+            Expires = DateTimeOffset.Now.Add(TimeSpan.FromDays(364)),
+            IsEssential = true,
+            Path = "/",
+            SameSite = SameSiteMode.Lax,
+        });
+        return Redirect("/home");
     }
 }
