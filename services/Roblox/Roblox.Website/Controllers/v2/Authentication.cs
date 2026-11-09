@@ -117,7 +117,6 @@ public class AuthenticationControllerV2 : ControllerBase
     [HttpPost("signup")]
     public async Task<SignupResponse> Signup([Required] SignUpRequest request)
     {
-        throw new RobloxException(503, 0, "Service temporarily unavailable");
         FeatureFlags.FeatureCheck(FeatureFlag.SignupEnabled);
         var usernameValid = await services.users.IsUsernameValid(request.username);
         if (!usernameValid)
